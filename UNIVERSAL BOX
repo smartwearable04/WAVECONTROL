@@ -1,5 +1,4 @@
 #include <ESP8266WiFi.h>
-#include <ESP8266WiFiMulti.h>
 #include <PubSubClient.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -9,43 +8,53 @@
 const char* mqtt_server = "o2b77a12.ala.eu-central-1.emqxsl.com";
 const int mqtt_port = 8883; // Secure TLS Port
 
+const char* mqtt_user = "smartglove";
+const char* mqtt_pass = "Smartw@04";
+
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
 // --- LCD & HARDWARE PINS (NodeMCU Mapping) ---
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-const int FAN_RELAY = 12;   // D6 - Safe for output
-const int LIGHT_RELAY = 14; // D5 - Safe for output
-const int RED_LED = 13;     // D7 - Safe for output
-const int YELLOW_LED = 16;  // D0 - Simple dumb LED toggle
+const int FAN_RELAY = 12;   // D6 
+const int LIGHT_RELAY = 14; // D5 
+const int RED_LED = 13;     // D7 
+const int YELLOW_LED = 16;  // D0 
 
 String serialInput = "";
 
-void setupHardware() {
-  pinMode(FAN_RELAY, OUTPUT);
-  pinMode(LIGHT_RELAY, OUTPUT);
-  pinMode(RED_LED, OUTPUT);
-  pinMode(YELLOW_LED, OUTPUT);
+// Robust Timers and State Trackers
+unsigned long lcdTimer = 0;
+unsigned long lastWiFiCheck = 0;
+unsigned long lastMqttCheck = 0;
+unsigned long lastLedToggle = 0;
 
-  // WAVE CONTROL Active-LOW Relays: HIGH (1) = OFF during boot
+bool lcdCustomActive = false;
+int lastSystemState = -1; // 0 = No WiFi, 1 = No Cloud, 2 = Online
+
+void setupHardware() {
+  // PREVENT RELAY GLITCHES: Set HIGH (OFF) before setting as OUTPUT
   digitalWrite(FAN_RELAY, HIGH);
   digitalWrite(LIGHT_RELAY, HIGH);
   digitalWrite(RED_LED, LOW);
   digitalWrite(YELLOW_LED, LOW);
 
-  // Initialize I2C for NodeMCU (SDA=4, SCL=5)
+  pinMode(FAN_RELAY, OUTPUT);
+  pinMode(LIGHT_RELAY, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+
   Wire.begin(4, 5);
 
-  // Startup LCD & Welcome Pattern
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
-  lcd.print("WAVE CONTROL BOX");
+  lcd.print("WAVE CONTROL");
   lcd.setCursor(0, 1);
   lcd.print("System Ready");
 
-  // Red & Yellow Startup Blink Pattern
+  // Visual Boot Sequence
   for (int i = 0; i < 3; i++) {
     digitalWrite(RED_LED, HIGH);
     digitalWrite(YELLOW_LED, LOW);
@@ -57,7 +66,6 @@ void setupHardware() {
   digitalWrite(YELLOW_LED, LOW);
 }
 
-// Function to flash Red LED when an incoming message is processed
 void flashRedLED() {
   for (int i = 0; i < 2; i++) {
     digitalWrite(RED_LED, HIGH);
@@ -67,72 +75,65 @@ void flashRedLED() {
   }
 }
 
-// Function to handle commands (from MQTT Cloud or Serial Monitor)
-void executeCommand(String command) {
-  command.trim();
-  
-  // Flash Red LED to show a message was received/processed
-  flashRedLED();
-
+void showLCDMessage(String line1, String line2 = "") {
   lcd.clear();
   lcd.setCursor(0, 0);
+  lcd.print(line1);
+  if (line2 != "") {
+    lcd.setCursor(0, 1);
+    lcd.print(line2);
+  }
+  lcdTimer = millis();
+  lcdCustomActive = true;
+}
+
+void executeCommand(String command) {
+  command.trim();
+  flashRedLED();
 
   if (command == "LIGHT_ON") {
     digitalWrite(LIGHT_RELAY, LOW);  // Active-LOW: LOW = ON
-    lcd.print("Light: ON");
-    Serial.println("Action executed: Light turned ON");
+    showLCDMessage("Light: ON");
   } 
   else if (command == "LIGHT_OFF") {
     digitalWrite(LIGHT_RELAY, HIGH); // Active-LOW: HIGH = OFF
-    lcd.print("Light: OFF");
-    Serial.println("Action executed: Light turned OFF");
+    showLCDMessage("Light: OFF");
   } 
   else if (command == "FAN_ON") {
-    digitalWrite(FAN_RELAY, LOW);    // Active-LOW: LOW = ON
-    lcd.print("Fan: ON");
-    Serial.println("Action executed: Fan turned ON");
+    digitalWrite(FAN_RELAY, LOW);    
+    showLCDMessage("Fan: ON");
   } 
   else if (command == "FAN_OFF") {
-    digitalWrite(FAN_RELAY, HIGH);   // Active-LOW: HIGH = OFF
-    lcd.print("Fan: OFF");
-    Serial.println("Action executed: Fan turned OFF");
+    digitalWrite(FAN_RELAY, HIGH);   
+    showLCDMessage("Fan: OFF");
   } 
   else if (command.startsWith("TEXT:")) {
     String customText = command.substring(5);
-    lcd.print(customText);
-    Serial.print("LCD updated to: ");
-    Serial.println(customText);
+    showLCDMessage(customText);
   } 
   else {
-    lcd.print("Unknown Cmd");
-    Serial.println("Received unknown command.");
+    showLCDMessage("Unknown Cmd");
   }
 }
 
-// MQTT Callback Function (Restored)
-void callback(char* topic, byte* payload, unsigned int length) {
-  String message = "";
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-  Serial.print("WAVE CONTROL Cloud Msg [");
-  Serial.print(topic);
-  Serial.print("] ");
-  Serial.println(message);
-
-  executeCommand(message);
-}
-
-// EEPROM Helper Functions for Wi-Fi Storage
+// --- CRASH-PROOF EEPROM STORAGE ---
 void saveCredentials(String ssid, String pass) {
   EEPROM.begin(512);
-  for (int i = 0; i < 96; ++i) EEPROM.write(i, 0); // Clear old data
   
-  for (unsigned int i = 0; i < ssid.length(); ++i) EEPROM.write(i, ssid[i]);
-  EEPROM.write(ssid.length(), '\0');
+  // Guard against string lengths exceeding limits
+  if (ssid.length() > 31) ssid = ssid.substring(0, 31);
+  if (pass.length() > 63) pass = pass.substring(0, 63);
+
+  EEPROM.write(0, ssid.length());
+  for (unsigned int i = 0; i < ssid.length(); ++i) {
+    EEPROM.write(1 + i, ssid[i]);
+  }
   
-  for (unsigned int i = 0; i < pass.length(); ++i) EEPROM.write(32 + i, pass[i]);
-  EEPROM.write(32 + pass.length(), '\0');
+  int passIndex = 33;
+  EEPROM.write(32, pass.length());
+  for (unsigned int i = 0; i < pass.length(); ++i) {
+    EEPROM.write(passIndex + i, pass[i]);
+  }
   
   EEPROM.commit();
   EEPROM.end();
@@ -140,11 +141,12 @@ void saveCredentials(String ssid, String pass) {
 
 String getStoredSSID() {
   EEPROM.begin(512);
+  int len = EEPROM.read(0);
   String ssid = "";
-  for (int i = 0; i < 32; ++i) {
-    char c = EEPROM.read(i);
-    if (c == '\0') break;
-    ssid += c;
+  if (len > 0 && len <= 31) {
+    for (int i = 0; i < len; ++i) {
+      ssid += (char)EEPROM.read(1 + i);
+    }
   }
   EEPROM.end();
   return ssid;
@@ -152,92 +154,78 @@ String getStoredSSID() {
 
 String getStoredPassword() {
   EEPROM.begin(512);
+  int len = EEPROM.read(32);
   String pass = "";
-  for (int i = 0; i < 64; ++i) {
-    char c = EEPROM.read(32 + i);
-    if (c == '\0') break;
-    pass += c;
+  if (len > 0 && len <= 63) {
+    int passIndex = 33;
+    for (int i = 0; i < len; ++i) {
+      pass += (char)EEPROM.read(passIndex + i);
+    }
   }
   EEPROM.end();
   return pass;
 }
 
-void connectWiFi() {
+void triggerWiFiConnect() {
   String ssid = getStoredSSID();
   String pass = getStoredPassword();
 
-  // If EEPROM is empty, use default fallback
-  if (ssid.length() == 0) {
-    ssid = "YOUR_DEFAULT_SSID";
-    pass = "YOUR_DEFAULT_PASSWORD";
+  // Fallback defaults if memory is wiped or empty
+  if (ssid.length() == 0 || ssid.length() > 31) {
+    ssid = "POCO X7 Pro";
+    pass = "987654321";
   }
 
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect(); // Clear bad states before reconnecting
+  delay(100);
   WiFi.begin(ssid.c_str(), pass.c_str());
+}
+
+void attemptMQTTConnect() {
+  String clientId = "WaveControlBox-";
+  clientId += String(ESP.getChipId(), HEX);
   
-  Serial.print("Connecting to Wi-Fi: ");
-  Serial.println(ssid);
-
-  int attempt = 0;
-  while (WiFi.status() != WL_CONNECTED) {
-    digitalWrite(YELLOW_LED, !digitalRead(YELLOW_LED)); // Blinking Yellow = Connecting
-    delay(500);
-    Serial.print(".");
-    attempt++;
-    if (attempt > 40) { 
-      Serial.println("\nConnection timeout. Type new credentials in Serial: SSID,PASSWORD");
-      break;
-    }
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(YELLOW_LED, HIGH); // Solid Yellow = Connected to Wi-Fi / Cloud Network
-    Serial.println("\nWiFi Connected!");
-    lcd.clear();
-    lcd.print("Cloud Connected!");
+  if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+    client.subscribe("astroreach/box/control");
+    showLCDMessage("Cloud Connected!");
   }
 }
 
-void reconnectMQTT() {
-  while (!client.connected()) {
-    Serial.print("Connecting to WAVE CONTROL Cloud...");
-    String clientId = "WaveControlBox-";
-    clientId += String(ESP.getChipId(), HEX);
-    
-    if (client.connect(clientId.c_str())) {
-      Serial.println("connected");
-      client.subscribe("astroreach/box/control");
-      digitalWrite(YELLOW_LED, HIGH); // Solid Yellow = Connected to Cloud Broker & Glove Ready
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      digitalWrite(YELLOW_LED, LOW);
-      delay(5000);
-    }
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
   }
+  executeCommand(message);
+}
+
+int getSystemState() {
+  if (WiFi.status() != WL_CONNECTED) return 0; // Offline
+  if (!client.connected()) return 1;           // Local network only
+  return 2;                                    // Fully Online
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(500); // Allow power rails to stabilize
 
   setupHardware();
-  connectWiFi();
+  triggerWiFiConnect();
 
-  espClient.setInsecure(); 
+  espClient.setInsecure(); // Ignore SSL certificates for faster, generic TLS link
+  espClient.setTimeout(5000); // Prevent blocking if broker drops packets
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
 }
 
 void loop() {
-  // Check for Serial Monitor input (Commands OR Hotspot update)
-  if (Serial.available() > 0) {
+  // 1. Buffer Overflow & Dynamic Credential Protection
+  while (Serial.available() > 0) {
     char incomingChar = Serial.read();
     if (incomingChar == '\n' || incomingChar == '\r') {
       if (serialInput.length() > 0) {
         serialInput.trim();
-        
-        // Check if user is updating hotspot: Format is "SSID,PASSWORD"
         int commaIndex = serialInput.indexOf(',');
         if (commaIndex > 0) {
           String newSsid = serialInput.substring(0, commaIndex);
@@ -245,32 +233,74 @@ void loop() {
           newSsid.trim();
           newPass.trim();
           
-          Serial.println("\nSaving new Wi-Fi credentials to EEPROM...");
           saveCredentials(newSsid, newPass);
-          Serial.println("Saved successfully! Rebooting NodeMCU...");
-          lcd.clear();
-          lcd.print("Wi-Fi Saved!");
+          showLCDMessage("Wi-Fi Saved!", "Rebooting...");
           delay(1500);
           ESP.restart();
         } else {
-          // Normal Command execution (LIGHT_ON, TEXT:xyz, etc.)
-          Serial.print("Executing Serial Command: ");
-          Serial.println(serialInput);
           executeCommand(serialInput);
         }
         serialInput = ""; 
       }
     } else {
       serialInput += incomingChar;
+      if (serialInput.length() > 100) serialInput = ""; // Prevent memory crash from garbage data
     }
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
+  // 2. Fetch System State
+  int currentState = getSystemState();
+
+  // 3. LED Behavior
+  if (currentState == 2) {
+    digitalWrite(YELLOW_LED, HIGH); 
+  } else {
+    // Non-blocking half-second blink for connection issues
+    if (millis() - lastLedToggle > 500) {
+      digitalWrite(YELLOW_LED, !digitalRead(YELLOW_LED));
+      lastLedToggle = millis();
+    }
   }
 
-  if (!client.connected()) {
-    reconnectMQTT();
+  // 4. Autonomous Recovery Mechanics (Retry every 5 seconds)
+  if (currentState == 0) {
+    if (millis() - lastWiFiCheck > 5000) {
+      triggerWiFiConnect();
+      lastWiFiCheck = millis();
+    }
+  } else if (currentState == 1) {
+    if (millis() - lastMqttCheck > 5000) {
+      attemptMQTTConnect();
+      lastMqttCheck = millis();
+    }
   }
-  client.loop();
+
+  // 5. Clear Temporary Commands from LCD
+  if (lcdCustomActive && (millis() - lcdTimer > 10000)) {
+    lcdCustomActive = false;
+    lastSystemState = -1; // Force a UI refresh
+  }
+
+  // 6. Dynamic Standby UI Update
+  if (!lcdCustomActive && (currentState != lastSystemState)) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WAVE CONTROL");
+    lcd.setCursor(0, 1);
+    
+    if (currentState == 0) {
+      lcd.print("No WiFi Link");
+    } else if (currentState == 1) {
+      lcd.print("No Cloud Link");
+    } else if (currentState == 2) {
+      lcd.print("Cloud Online");
+    }
+    
+    lastSystemState = currentState; 
+  }
+
+  // 7. Keep Cloud Ping Active
+  if (currentState == 2) {
+    client.loop();
+  }
 }
